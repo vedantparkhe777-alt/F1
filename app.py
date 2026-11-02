@@ -19,9 +19,13 @@ import os
 import tempfile
 import warnings
 
+# Ensure headless Matplotlib backend on cloud servers (Linux/Streamlit Cloud)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 import fastf1
 import fastf1.plotting
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st

@@ -1,0 +1,13 @@
+# Streamlit secrets (NEVER commit credentials to git)
+.streamlit/secrets.toml
+
+# FastF1 disk cache
+f1_cache/
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.env
+.venv/
+env/

@@ -8,17 +8,15 @@ Prerequisites:
     pip install -r requirements.txt
 
     FastF1 ≥ 3.4 requires a free Formula 1 account for live-timing data.
-    Set the following environment variables BEFORE launching the app:
+    Set the following in .streamlit/secrets.toml (locally) or Streamlit Cloud Secrets:
 
-        set F1_USERNAME=your@email.com
-        set F1_PASSWORD=your_password
-        streamlit run app.py
-
-    Alternatively, create a `.env` file in this directory (see README).
+        F1_USERNAME = "your@email.com"
+        F1_PASSWORD = "your_password"
 """
 
 import datetime
 import os
+import tempfile
 import warnings
 
 import fastf1
@@ -30,12 +28,15 @@ import streamlit as st
 from matplotlib.collections import LineCollection
 from matplotlib.patches import Patch
 
-# ── Load credentials from .streamlit/secrets.toml ─────────────────────
+# ── Load credentials from .streamlit/secrets.toml or Streamlit Cloud Secrets ──
 try:
-    os.environ.setdefault("F1_USERNAME", st.secrets["F1_USERNAME"])
-    os.environ.setdefault("F1_PASSWORD", st.secrets["F1_PASSWORD"])
+    if hasattr(st, "secrets"):
+        if "F1_USERNAME" in st.secrets:
+            os.environ.setdefault("F1_USERNAME", st.secrets["F1_USERNAME"])
+        if "F1_PASSWORD" in st.secrets:
+            os.environ.setdefault("F1_PASSWORD", st.secrets["F1_PASSWORD"])
 except Exception:
-    pass  # Will be caught later in sidebar_controls
+    pass
 
 # ──────────────────────────────────────────────────────────────────────
 # 0.  Global Setup
@@ -48,14 +49,21 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Enable FastF1 disk cache on first import
+# Enable FastF1 disk cache with cloud fallback
 _cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "f1_cache")
-os.makedirs(_cache_dir, exist_ok=True)
+try:
+    os.makedirs(_cache_dir, exist_ok=True)
+except Exception:
+    _cache_dir = os.path.join(tempfile.gettempdir(), "f1_cache")
+    os.makedirs(_cache_dir, exist_ok=True)
+
 try:
     fastf1.Cache.configure(cache_dir=_cache_dir)
 except Exception:
-    # Fallback for older FastF1 versions
-    fastf1.Cache.enable_cache(_cache_dir)
+    try:
+        fastf1.Cache.enable_cache(_cache_dir)
+    except Exception:
+        pass
 
 # Configure Matplotlib with the official F1 dark theme
 fastf1.plotting.setup_mpl(mpl_timedelta_support=False, color_scheme="fastf1")
@@ -166,15 +174,26 @@ def load_schedule(year: int) -> pd.DataFrame:
     return schedule
 
 
-@st.cache_resource(show_spinner="Loading session data – this may take a minute …")
+@st.cache_resource(show_spinner="Loading session data – this may take a moment …")
 def load_session(year: int, event_name: str, session_type: str):
     """Load and return a full FastF1 Session object (cached as a resource).
 
-    We use cache_resource because the Session object is not serialisable
-    but IS safely shareable across reruns.
+    Verifies that lap timing data was successfully parsed and available.
     """
     session = fastf1.get_session(year, event_name, session_type)
     session.load(telemetry=True, laps=True, weather=False, messages=False)
+
+    # Validate that laps were populated
+    try:
+        laps = session.laps
+        if laps is None or len(laps) == 0:
+            raise RuntimeError("No lap records found in session.")
+    except Exception as e:
+        raise RuntimeError(
+            f"Timing or telemetry data for '{event_name}' ({session_type}) is unavailable or not yet published by the FIA. "
+            f"({e})"
+        ) from e
+
     return session
 
 
@@ -227,8 +246,17 @@ def _dark_axes(fig, axes):
 def build_telemetry_comparison(session, driver1, driver2, accent):
     """Speed / Throttle / Brake traces vs distance for two drivers."""
     laps = session.laps
-    lap1 = laps.pick_drivers(driver1).pick_fastest()
-    lap2 = laps.pick_drivers(driver2).pick_fastest()
+    d1_laps = laps.pick_drivers(driver1)
+    d2_laps = laps.pick_drivers(driver2)
+
+    if d1_laps.empty or d2_laps.empty:
+        raise ValueError(f"One or both drivers ({driver1}, {driver2}) have no lap records in this session.")
+
+    lap1 = d1_laps.pick_fastest()
+    lap2 = d2_laps.pick_fastest()
+
+    if lap1 is None or lap2 is None:
+        raise ValueError(f"Fastest lap not found for {driver1} or {driver2}.")
 
     tel1 = lap1.get_telemetry().add_distance()
     tel2 = lap2.get_telemetry().add_distance()
@@ -269,8 +297,17 @@ def build_telemetry_comparison(session, driver1, driver2, accent):
 def build_track_speed_heatmap(session, driver, accent):
     """Circuit outline coloured by speed (plasma) using LineCollection."""
     laps = session.laps
-    lap = laps.pick_drivers(driver).pick_fastest()
+    drv_laps = laps.pick_drivers(driver)
+    if drv_laps.empty:
+        raise ValueError(f"No lap records for driver {driver}.")
+
+    lap = drv_laps.pick_fastest()
+    if lap is None:
+        raise ValueError(f"No valid fastest lap found for {driver}.")
+
     tel = lap.get_telemetry()
+    if tel is None or tel.empty:
+        raise ValueError(f"Telemetry unavailable for {driver}.")
 
     x = tel["X"].values.astype(float)
     y = tel["Y"].values.astype(float)
@@ -311,6 +348,9 @@ def build_tire_strategy(session, accent):
     laps_clean = laps[["Driver", "Stint", "Compound", "LapNumber"]].copy()
     laps_clean.dropna(subset=["Compound"], inplace=True)
 
+    if laps_clean.empty:
+        raise ValueError("No tyre stint data available for this session.")
+
     stints = (
         laps_clean.groupby(["Driver", "Stint", "Compound"])
         .count()
@@ -346,7 +386,7 @@ def build_tire_strategy(session, accent):
             ax.text(
                 prev + row["StintLength"] / 2,
                 driver,
-                row["Compound"][0],
+                str(row["Compound"])[0] if row["Compound"] else "",
                 ha="center", va="center",
                 fontsize=7, fontweight="bold", color="#111",
             )
@@ -375,8 +415,17 @@ def build_tire_strategy(session, accent):
 def build_minisector_dominance(session, driver1, driver2, accent, n_sectors=25):
     """Track map coloured by which driver is faster per mini-sector."""
     laps = session.laps
-    lap1 = laps.pick_drivers(driver1).pick_fastest()
-    lap2 = laps.pick_drivers(driver2).pick_fastest()
+    d1_laps = laps.pick_drivers(driver1)
+    d2_laps = laps.pick_drivers(driver2)
+
+    if d1_laps.empty or d2_laps.empty:
+        raise ValueError(f"One or both drivers ({driver1}, {driver2}) have no lap records.")
+
+    lap1 = d1_laps.pick_fastest()
+    lap2 = d2_laps.pick_fastest()
+
+    if lap1 is None or lap2 is None:
+        raise ValueError("Could not find valid fastest laps for comparison.")
 
     tel1 = lap1.get_telemetry().add_distance()
     tel2 = lap2.get_telemetry().add_distance()
@@ -448,28 +497,26 @@ def sidebar_controls():
     if has_creds:
         st.sidebar.success("✅ F1 account connected", icon="🔑")
     else:
-        with st.sidebar.expander("🔑 F1 Account (required for telemetry)", expanded=True):
+        with st.sidebar.expander("🔑 F1 Account Required", expanded=True):
             st.markdown(
-                "FastF1 ≥ 3.4 requires a **free** [Formula 1 account]"
-                "(https://account.formula1.com/) to fetch live-timing data.\n\n"
-                "Set these env vars **before** launching Streamlit:\n"
-                "```\n"
-                "set F1_USERNAME=you@email.com\n"
-                "set F1_PASSWORD=your_password\n"
-                "streamlit run app.py\n"
+                "FastF1 ≥ 3.4 requires a free [Formula 1 account](https://account.formula1.com/) "
+                "for live-timing telemetry.\n\n"
+                "**On Streamlit Cloud:** Add these to **Settings → Secrets**:\n"
+                "```toml\n"
+                "F1_USERNAME = \"you@email.com\"\n"
+                "F1_PASSWORD = \"your_password\"\n"
                 "```"
             )
-            # Allow entering credentials in the sidebar for convenience
-            f1_user = st.text_input("Email", key="f1_user")
-            f1_pass = st.text_input("Password", type="password", key="f1_pass")
+            f1_user = st.text_input("F1 Account Email", key="f1_user")
+            f1_pass = st.text_input("F1 Account Password", type="password", key="f1_pass")
             if f1_user and f1_pass:
                 os.environ["F1_USERNAME"] = f1_user
                 os.environ["F1_PASSWORD"] = f1_pass
-                st.success("Credentials set for this session!")
-                has_creds = True
+                st.sidebar.success("Credentials saved for this session!")
+                st.rerun()
 
     available_years = list(range(2018, 2027))
-    year = st.sidebar.selectbox("🗓️ Season", available_years, index=available_years.index(2025))
+    year = st.sidebar.selectbox("🗓️ Season", available_years, index=available_years.index(2026))
 
     # Apply season theme
     theme = SEASON_THEMES.get(year, DEFAULT_THEME)
@@ -512,7 +559,7 @@ def sidebar_controls():
 
     # ── Completed races dropdown ──────────────────────────────────
     if completed.empty:
-        st.sidebar.warning("No completed races for this season yet.")
+        st.sidebar.warning(f"No completed races on record for {year} yet.")
         st.stop()
 
     with st.sidebar.expander(f"✅ Completed Races ({len(completed)})", expanded=False):
@@ -521,7 +568,8 @@ def sidebar_controls():
             st.markdown(f"• {name}")
 
     race_names = completed["EventName"].tolist()
-    selected_race = st.sidebar.selectbox("🏁 Select Race", race_names, index=len(race_names) - 1)
+    # Default to first race or last race
+    selected_race = st.sidebar.selectbox("🏁 Select Race", race_names, index=0)
 
     session_map = {
         "Race": "R",
@@ -545,24 +593,30 @@ def main():
     year, race, session_code, session_label, accent = sidebar_controls()
 
     st.markdown("# 🏎️ F1 Telemetry & Strategy Studio")
-    st.markdown(f"**{year}  ·  {race}  ·  {session_label}**")
+    st.markdown(f"### **{year}  ·  {race}  ·  {session_label}**")
 
-    # ── Load session ──────────────────────────────────────────────
+    # ── Load session & extract drivers safely ─────────────────────
     try:
         session = load_session(year, race, session_code)
+        laps_df = session.laps
+        drivers = sorted(laps_df["Driver"].dropna().unique())
+
+        if len(drivers) < 2:
+            st.warning(f"⚠️ Only {len(drivers)} driver(s) found with telemetry in this session. At least 2 drivers are needed for comparisons.")
+            st.info("💡 Try selecting another Grand Prix from the **Select Race** dropdown in the sidebar.")
+            st.stop()
     except Exception as e:
         st.error(
-            f"⚠️ Could not load telemetry for **{race} ({session_label})**.  \n"
-            f"The session data may be unavailable or corrupted on the FIA servers.  \n"
-            f"```{e}```"
+            f"### ⚠️ Session Telemetry Unavailable\n\n"
+            f"Could not load telemetry for **{year} {race} ({session_label})**.\n\n"
+            f"**Common reasons:**\n"
+            f"1. **Recent Race Delay:** If this race occurred recently, the official FIA live-timing data can take several days to be formatted and published by FastF1.\n"
+            f"2. **Corrupted Feed:** The raw telemetry feed for this specific Grand Prix session may be corrupted or unparsed on the FIA servers.\n"
+            f"3. **Missing Cloud Secrets:** On Streamlit Cloud, make sure your F1 account email and password are configured in **Settings → Secrets** (`F1_USERNAME` and `F1_PASSWORD`).\n\n"
+            f"👉 **Try selecting another race from the sidebar dropdown (e.g. Round 1 Australian Grand Prix, Round 2 Chinese Grand Prix, or Season 2024 / 2025).**\n\n"
+            f"<details><summary>Technical Error Details</summary><code>{e}</code></details>",
+            icon="🏎️",
         )
-        st.stop()
-
-    laps_df = session.laps
-    drivers = sorted(laps_df["Driver"].unique())
-
-    if len(drivers) < 2:
-        st.warning("Not enough driver data available for comparison.")
         st.stop()
 
     # ── Driver pickers (below title, above tabs) ──────────────────
@@ -587,7 +641,7 @@ def main():
             fig = build_telemetry_comparison(session, driver1, driver2, accent)
             st.pyplot(fig, clear_figure=True)
         except Exception as e:
-            st.error(f"Telemetry comparison unavailable: {e}")
+            st.warning(f"Telemetry comparison unavailable for {driver1} vs {driver2}: {e}")
 
     # ─── Tab 2: Track Speed Heatmap ──────────────────────────────
     with tab_heatmap:
@@ -596,7 +650,7 @@ def main():
             fig = build_track_speed_heatmap(session, heatmap_driver, accent)
             st.pyplot(fig, clear_figure=True)
         except Exception as e:
-            st.error(f"Track speed heatmap unavailable: {e}")
+            st.warning(f"Track speed heatmap unavailable for {heatmap_driver}: {e}")
 
     # ─── Tab 3: Tire Strategy ────────────────────────────────────
     with tab_strat:
@@ -604,7 +658,7 @@ def main():
             fig = build_tire_strategy(session, accent)
             st.pyplot(fig, clear_figure=True)
         except Exception as e:
-            st.error(f"Tire strategy chart unavailable: {e}")
+            st.warning(f"Tire strategy chart unavailable: {e}")
 
     # ─── Tab 4: Mini-Sector Dominance ────────────────────────────
     with tab_mini:
@@ -613,7 +667,7 @@ def main():
             fig = build_minisector_dominance(session, driver1, driver2, accent, n_sectors)
             st.pyplot(fig, clear_figure=True)
         except Exception as e:
-            st.error(f"Mini-sector analysis unavailable: {e}")
+            st.warning(f"Mini-sector analysis unavailable for {driver1} vs {driver2}: {e}")
 
 
 if __name__ == "__main__":

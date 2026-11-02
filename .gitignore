@@ -1,8 +1,10 @@
 # Streamlit secrets (NEVER commit credentials to git)
 .streamlit/secrets.toml
 
-# FastF1 disk cache
-f1_cache/
+# Ignore large SQLite HTTP cache (can exceed GitHub 100MB single-file limit)
+*.sqlite
+f1_cache/*.sqlite
+f1_cache/**/*.sqlite
 
 # Python cache & build artifacts
 __pycache__/
